@@ -1,0 +1,38 @@
+/* src/App.css */
+
+.App {
+  text-align: center;
+}
+
+/* Custom scrollbar for better UX */
+::-webkit-scrollbar {
+  width: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #f1f1f1;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #c1c1c1;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #a8a8a8;
+}
+
+/* Focus styles for accessibility */
+.focus\:ring-2:focus {
+  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.5);
+}
+
+/* Animation for form transitions */
+.form-transition {
+  transition: all 0.3s ease-in-out;
+}
+
+/* File upload area hover effects */
+.file-upload-area {
+  transition: border-color 0.2s ease-in-out, background-color 0.2s ease-in-out;
+}
