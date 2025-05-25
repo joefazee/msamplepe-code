@@ -70,6 +70,10 @@ type Store interface {
 	UpdateWalletHistoryStatusTx(ctx context.Context, arg UpdateWalletHistoryStatusParams) (*WalletHistory, error)
 	GetWalletHistory(ctx context.Context, id int64) (*WalletHistory, error)
 	CreateWalletHistoryTx(ctx context.Context, arg CreateWalletHistoryParams) (*WalletHistory, error)
+	CreateFormDefinitionTx(ctx context.Context, input *FormDefinitionInput) (*FormDefinition, error)
+	ProcessFormSubmissionTx(ctx context.Context, input *FormSubmissionInput) (*FormSubmission, error)
+	UpdateFormSubmissionTx(ctx context.Context, input *FormSubmissionUpdateInput) (*FormSubmission, error)
+	SaveStepProgressTx(ctx context.Context, input *SaveStepProgressInput) error
 }
 
 type SQLStore struct {

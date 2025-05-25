@@ -2,6 +2,8 @@ package db
 
 import (
 	"database/sql"
+	"encoding/json"
+	"github.com/sqlc-dev/pqtype"
 	"time"
 
 	"github.com/google/uuid"
@@ -71,4 +73,12 @@ func NullUUIDToString(u uuid.NullUUID) string {
 		return ""
 	}
 	return u.UUID.String()
+}
+
+// NullRawMessage wraps a JSON RawMessage into a NullRawMessage, marking it valid if the input data is not nil.
+func NullRawMessage(data []byte) pqtype.NullRawMessage {
+	return pqtype.NullRawMessage{
+		RawMessage: json.RawMessage(data),
+		Valid:      data != nil,
+	}
 }
