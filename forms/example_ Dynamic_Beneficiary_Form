@@ -1,0 +1,154 @@
+func CreateBeneficiaryForm(ctx context.Context, store db.Store, creatorID uuid.UUID) error {
+    // This form demonstrates dynamic fields based on user selection
+    input := &db.FormDefinitionInput{
+        Name:             "Add Beneficiary",
+        Slug:             "add-beneficiary",
+        Description:      "Add a new beneficiary to your account",
+        FormType:         "beneficiary",
+        IsMultiStep:      false,
+        RequiresApproval: false,
+        CreatedBy:        creatorID,
+        Fields: []db.FieldInput{
+            {
+                FieldName:    "beneficiary_type",
+                FieldType:    "radio",
+                Label:        map[string]string{"en": "Beneficiary Type"},
+                DisplayOrder: 1,
+                IsRequired:   true,
+                Options: map[string]interface{}{
+                    "type": "static",
+                    "static": []map[string]interface{}{
+                        {"value": "individual", "label": map[string]string{"en": "Individual"}},
+                        {"value": "business", "label": map[string]string{"en": "Business"}},
+                    },
+                },
+            },
+            // Individual fields
+            {
+                FieldName:    "first_name",
+                FieldType:    "text",
+                Label:        map[string]string{"en": "First Name"},
+                DisplayOrder: 2,
+                IsRequired:   true,
+                ConditionalLogic: map[string]interface{}{
+                    "action": "show",
+                    "conditions": []map[string]interface{}{
+                        {
+                            "field":    "beneficiary_type",
+                            "operator": "equals",
+                            "value":    "individual",
+                        },
+                    },
+                    "logic": "all",
+                },
+            },
+            {
+                FieldName:    "last_name",
+                FieldType:    "text",
+                Label:        map[string]string{"en": "Last Name"},
+                DisplayOrder: 3,
+                IsRequired:   true,
+                ConditionalLogic: map[string]interface{}{
+                    "action": "show",
+                    "conditions": []map[string]interface{}{
+                        {
+                            "field":    "beneficiary_type",
+                            "operator": "equals",
+                            "value":    "individual",
+                        },
+                    },
+                    "logic": "all",
+                },
+            },
+            // Business fields
+            {
+                FieldName:    "business_name",
+                FieldType:    "text",
+                Label:        map[string]string{"en": "Business Name"},
+                DisplayOrder: 4,
+                IsRequired:   true,
+                ConditionalLogic: map[string]interface{}{
+                    "action": "show",
+                    "conditions": []map[string]interface{}{
+                        {
+                            "field":    "beneficiary_type",
+                            "operator": "equals",
+                            "value":    "business",
+                        },
+                    },
+                    "logic": "all",
+                },
+            },
+            {
+                FieldName:    "business_registration",
+                FieldType:    "text",
+                Label:        map[string]string{"en": "Business Registration Number"},
+                DisplayOrder: 5,
+                IsRequired:   true,
+                ConditionalLogic: map[string]interface{}{
+                    "action": "show",
+                    "conditions": []map[string]interface{}{
+                        {
+                            "field":    "beneficiary_type",
+                            "operator": "equals",
+                            "value":    "business",
+                        },
+                    },
+                    "logic": "all",
+                },
+            },
+            // Common fields
+            {
+                FieldName:    "relationship",
+                FieldType:    "select",
+                Label:        map[string]string{"en": "Relationship"},
+                DisplayOrder: 6,
+                IsRequired:   true,
+                Options: map[string]interface{}{
+                    "type": "static",
+                    "static": []map[string]interface{}{
+                        {"value": "family", "label": map[string]string{"en": "Family Member"}},
+                        {"value": "friend", "label": map[string]string{"en": "Friend"}},
+                        {"value": "business_partner", "label": map[string]string{"en": "Business Partner"}},
+                        {"value": "employee", "label": map[string]string{"en": "Employee"}},
+                        {"value": "vendor", "label": map[string]string{"en": "Vendor/Supplier"}},
+                        {"value": "other", "label": map[string]string{"en": "Other"}},
+                    },
+                },
+            },
+            {
+                FieldName:    "percentage",
+                FieldType:    "number",
+                Label:        map[string]string{"en": "Beneficiary Percentage"},
+                HelpText:     map[string]string{"en": "Percentage of assets to allocate to this beneficiary"},
+                DisplayOrder: 7,
+                IsRequired:   true,
+                ValidationRules: map[string]interface{}{
+                    "required": true,
+                    "min":      1,
+                    "max":      100,
+                },
+            },
+        },
+        PersistenceConfig: &db.PersistenceConfigInput{
+            PersistenceMode: "json",
+        },
+    }
+
+    form, err := store.CreateFormDefinitionTx(ctx, input)
+    if err != nil {
+        return err
+    }
+
+    // Available to all authenticated users
+    _, err = store.CreateFormAssignment(ctx, db.CreateFormAssignmentParams{
+        ID:               uuid.New(),
+        FormDefinitionID: form.ID,
+        AssignmentType:   "custom",
+        AssignmentValue:  "all_users",
+        Priority:         1,
+        CreatedBy:        creatorID,
+    })
+
+    return err
+}

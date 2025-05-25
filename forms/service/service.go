@@ -2,9 +2,11 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"github.com/timchuks/monieverse/internal/config"
+	"github.com/timchuks/monieverse/internal/logger"
 	"log"
 	"mime/multipart"
 	"path/filepath"
@@ -25,6 +27,47 @@ type FormService struct {
 	notifier        notifier.Notifier
 	taskDistributor worker.TaskDistributor
 	config          *config.Config
+	logger          logger.Logger
+	fileValidator   *FileValidator
+}
+
+type CreateSubmissionInput struct {
+	FormID     uuid.UUID                          `json:"form_id"`
+	UserID     uuid.UUID                          `json:"user_id"`
+	Data       map[string]interface{}             `json:"data"`
+	Files      map[string][]*multipart.FileHeader `json:"-"`
+	Status     string                             `json:"status"`     // draft, submitted
+	IsPartial  bool                               `json:"is_partial"` // For partial updates
+	Metadata   map[string]interface{}             `json:"metadata"`
+	StepNumber *int32                             `json:"step_number"` // For step-specific validation
+}
+
+type UpdateSubmissionInput struct {
+	SubmissionID    uuid.UUID                          `json:"submission_id"`
+	UserID          uuid.UUID                          `json:"user_id"`
+	Data            map[string]interface{}             `json:"data"`
+	Files           map[string][]*multipart.FileHeader `json:"-"`
+	Status          string                             `json:"status"`
+	IsPartialUpdate bool                               `json:"is_partial_update"`
+	Metadata        map[string]interface{}             `json:"metadata"`
+	StepNumber      *int32                             `json:"step_number"`
+}
+
+type SaveStepProgressInput struct {
+	SubmissionID uuid.UUID                          `json:"submission_id"`
+	UserID       uuid.UUID                          `json:"user_id"`
+	StepNumber   int32                              `json:"step_number"`
+	Status       string                             `json:"status"` // in_progress, completed
+	Data         map[string]interface{}             `json:"data"`
+	Files        map[string][]*multipart.FileHeader `json:"-"`
+	Metadata     map[string]interface{}             `json:"metadata"`
+}
+
+type StepProgressResult struct {
+	Success              bool  `json:"success"`
+	CurrentStep          int32 `json:"current_step"`
+	CompletionPercentage int32 `json:"completion_percentage"`
+	AllStepsCompleted    bool  `json:"all_steps_completed"`
 }
 
 func NewFormService(
@@ -33,12 +76,18 @@ func NewFormService(
 	notifier notifier.Notifier,
 	taskDistributor worker.TaskDistributor,
 	config *config.Config,
+	virusScanner VirusScanner,
+	contentValidator ContentValidator,
+	logger logger.Logger,
 ) *FormService {
+
+	fileValidator := NewFileValidator(config, virusScanner, contentValidator)
 	return &FormService{
 		store:           store,
 		uploader:        uploader,
 		notifier:        notifier,
 		taskDistributor: taskDistributor,
+		fileValidator:   fileValidator,
 		config:          config,
 	}
 }
@@ -718,7 +767,7 @@ func (s *FormService) UpdateFormSubmission(ctx context.Context, input UpdateSubm
 	// Get form definition
 	form, err := s.store.GetFormDefinition(ctx, submission.FormDefinitionID)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("form not found: %w", err)
 	}
 
 	// Check if form is editable
@@ -735,12 +784,36 @@ func (s *FormService) UpdateFormSubmission(ctx context.Context, input UpdateSubm
 	// Get fields for validation
 	fields, err := s.store.GetFormFields(ctx, form.ID)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to get form fields: %w", err)
+	}
+
+	// Determine validation context
+	validationCtx := ValidationContext{
+		ProvidedFields: input.Data,
+	}
+
+	switch input.Status {
+	case "draft":
+		validationCtx.Mode = ValidationModePartial
+	case "submitted":
+		validationCtx.Mode = ValidationModeFull
+	default:
+		if input.IsPartialUpdate {
+			validationCtx.Mode = ValidationModePartial
+		} else {
+			validationCtx.Mode = ValidationModeFull
+		}
+	}
+
+	// Add step-specific validation if step number provided
+	if input.StepNumber != nil {
+		validationCtx.Mode = ValidationModeStep
+		validationCtx.StepNumber = input.StepNumber
 	}
 
 	// Validate the updated data
-	if err := s.validateSubmission(fields, input.Data); err != nil {
-		return nil, err
+	if err := s.ValidateSubmission(fields, input.Data, validationCtx); err != nil {
+		return nil, fmt.Errorf("validation failed: %w", err)
 	}
 
 	// Trigger before_update events
@@ -756,19 +829,21 @@ func (s *FormService) UpdateFormSubmission(ctx context.Context, input UpdateSubm
 
 		var fileConfig FileConfig
 		if field.FileConfig != nil {
-			json.Unmarshal(field.FileConfig, &fileConfig)
+			if err := json.Unmarshal(field.FileConfig, &fileConfig); err != nil {
+				return nil, fmt.Errorf("failed to parse file config for field %s: %w", fieldName, err)
+			}
 		}
 
 		uploadedFiles, err := s.handleFileUploads(ctx, input.UserID, fieldName, fileHeaders, &fileConfig)
 		if err != nil {
-			return nil, fmt.Errorf("failed to upload files: %w", err)
+			return nil, fmt.Errorf("failed to upload files for field %s: %w", fieldName, err)
 		}
 
 		newFiles = append(newFiles, uploadedFiles...)
 	}
 
 	// Process submission update through transaction
-	updateInput := &db.FormSubmissionUpdateInput{
+	updateTxInput := &db.FormSubmissionUpdateInput{
 		SubmissionID:     input.SubmissionID,
 		FormDefinitionID: form.ID,
 		UserID:           input.UserID,
@@ -780,9 +855,9 @@ func (s *FormService) UpdateFormSubmission(ctx context.Context, input UpdateSubm
 		ExistingData:     submission.SubmissionData,
 	}
 
-	updatedSubmission, err := s.store.UpdateFormSubmissionTx(ctx, updateInput)
+	updatedSubmission, err := s.store.UpdateFormSubmissionTx(ctx, updateTxInput)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to update submission: %w", err)
 	}
 
 	// Trigger after_update events
@@ -801,16 +876,6 @@ func (s *FormService) getFileURL(file db.FormSubmissionFile) string {
 	return url
 }
 
-type UpdateSubmissionInput struct {
-	SubmissionID    uuid.UUID                          `json:"submission_id"`
-	UserID          uuid.UUID                          `json:"user_id"`
-	Data            map[string]interface{}             `json:"data"`
-	Files           map[string][]*multipart.FileHeader `json:"-"`
-	Status          string                             `json:"status"`
-	IsPartialUpdate bool                               `json:"is_partial_update"`
-	Metadata        map[string]interface{}             `json:"metadata,omitempty"`
-}
-
 // SaveStepProgress saves progress for a specific step
 func (s *FormService) SaveStepProgress(ctx context.Context, input SaveStepProgressInput) (*StepProgressResult, error) {
 	// Get submission
@@ -827,12 +892,12 @@ func (s *FormService) SaveStepProgress(ctx context.Context, input SaveStepProgre
 	// Get form and steps
 	form, err := s.store.GetFormDefinition(ctx, submission.FormDefinitionID)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("form not found: %w", err)
 	}
 
 	steps, err := s.store.GetFormSteps(ctx, form.ID)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to get form steps: %w", err)
 	}
 
 	// Find the step
@@ -845,40 +910,58 @@ func (s *FormService) SaveStepProgress(ctx context.Context, input SaveStepProgre
 	}
 
 	if currentStep == nil {
-		return nil, fmt.Errorf("step not found")
+		return nil, fmt.Errorf("step %d not found", input.StepNumber)
 	}
 
 	// Get fields for this step
 	fields, err := s.store.GetFormFieldsByStep(ctx, currentStep.ID)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to get step fields: %w", err)
 	}
 
 	// Validate step data if completing
 	if input.Status == "completed" {
-		if err := s.validateStepData(fields, input.Data); err != nil {
-			return nil, err
+		validationCtx := ValidationContext{
+			Mode:           ValidationModeStep,
+			StepNumber:     &input.StepNumber,
+			ProvidedFields: input.Data,
+		}
+
+		if err := s.ValidateSubmissionWithFiles(fields, input.Data, input.Files, validationCtx); err != nil {
+			return nil, fmt.Errorf("step validation failed: %w", err)
 		}
 	}
 
+	// Handle file uploads for this step
+	var submissionFiles []db.FormSubmissionFileInput
+	if len(input.Files) > 0 {
+		uploadedFiles, err := s.handleValidatedFileUploads(ctx, fields, input.UserID, input.Files)
+		if err != nil {
+			return nil, fmt.Errorf("failed to upload step files: %w", err)
+		}
+		submissionFiles = uploadedFiles
+	}
+
 	// Save step progress
-	err = s.store.SaveStepProgressTx(ctx, &db.SaveStepProgressInput{
+	saveInput := &db.SaveStepProgressInput{
 		SubmissionID: input.SubmissionID,
 		StepID:       currentStep.ID,
 		StepNumber:   input.StepNumber,
 		Status:       input.Status,
 		Data:         input.Data,
 		UserID:       input.UserID,
-	})
+		Files:        submissionFiles,
+	}
 
+	err = s.store.SaveStepProgressTx(ctx, saveInput)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to save step progress: %w", err)
 	}
 
 	// Calculate overall progress
 	allProgress, err := s.store.GetAllStepProgress(ctx, db.NewNullUUID(input.SubmissionID))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to get progress: %w", err)
 	}
 
 	completedSteps := 0
@@ -913,6 +996,10 @@ func (s *FormService) SaveStepProgress(ctx context.Context, input SaveStepProgre
 		CurrentStepNumber:    db.NewNullInt32(currentStepNumber),
 		CompletionPercentage: db.NewNullInt32(completionPercentage),
 	})
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to update submission progress: %w", err)
+	}
 
 	return &StepProgressResult{
 		Success:              true,
@@ -1061,18 +1148,196 @@ func (s *FormService) CompleteForm(ctx context.Context, submissionID uuid.UUID, 
 	})
 }
 
-// Input types
-type SaveStepProgressInput struct {
-	SubmissionID uuid.UUID              `json:"submission_id"`
-	UserID       uuid.UUID              `json:"user_id"`
-	StepNumber   int32                  `json:"step_number"`
-	Status       string                 `json:"status"` // 'in_progress' or 'completed'
-	Data         map[string]interface{} `json:"data"`
+// CreateSubmission creates a new form submission (replaces SubmitForm)
+func (s *FormService) CreateSubmission(ctx context.Context, input CreateSubmissionInput) (*db.FormSubmission, error) {
+	// Validate form exists and is active
+	form, err := s.store.GetFormDefinition(ctx, input.FormID)
+	if err != nil {
+		return nil, fmt.Errorf("form not found: %w", err)
+	}
+
+	if !form.IsActive {
+		return nil, fmt.Errorf("form is not active")
+	}
+
+	// Check if user already has a draft submission for this form
+	existingSubmission, _ := s.store.GetFormSubmissionByUserAndForm(ctx, db.GetFormSubmissionByUserAndFormParams{
+		UserID:           input.UserID,
+		FormDefinitionID: form.ID,
+		Status:           "draft",
+	})
+
+	// If creating a draft and one already exists, update it instead
+	if input.Status == "draft" && existingSubmission.ID != uuid.Nil {
+		updateInput := UpdateSubmissionInput{
+			SubmissionID:    existingSubmission.ID,
+			UserID:          input.UserID,
+			Data:            input.Data,
+			Files:           input.Files,
+			Status:          input.Status,
+			IsPartialUpdate: input.IsPartial,
+			Metadata:        input.Metadata,
+			StepNumber:      input.StepNumber,
+		}
+		return s.UpdateFormSubmission(ctx, updateInput)
+	}
+
+	// Get fields for validation
+	fields, err := s.store.GetFormFields(ctx, form.ID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get form fields: %w", err)
+	}
+
+	// Determine validation context
+	validationCtx := ValidationContext{
+		ProvidedFields: input.Data,
+	}
+
+	switch input.Status {
+	case "draft":
+		validationCtx.Mode = ValidationModePartial
+	case "submitted":
+		validationCtx.Mode = ValidationModeFull
+	default:
+		if input.IsPartial {
+			validationCtx.Mode = ValidationModePartial
+		} else {
+			validationCtx.Mode = ValidationModeFull
+		}
+	}
+
+	// Add step-specific validation if step number provided
+	if input.StepNumber != nil {
+		validationCtx.Mode = ValidationModeStep
+		validationCtx.StepNumber = input.StepNumber
+	}
+
+	// Validate submission
+	if err = s.ValidateSubmission(fields, input.Data, validationCtx); err != nil {
+		return nil, fmt.Errorf("validation failed: %w", err)
+	}
+
+	// Trigger before_submit events
+	eventType := "before_submit"
+	if input.Status == "draft" {
+		eventType = "before_draft_create"
+	}
+	s.triggerEvents(ctx, form.ID, eventType, input)
+
+	// Handle file uploads with validated files
+	var submissionFiles []db.FormSubmissionFileInput
+	if len(input.Files) > 0 {
+		uploadedFiles, err := s.handleValidatedFileUploads(ctx, fields, input.UserID, input.Files)
+		if err != nil {
+			return nil, fmt.Errorf("failed to upload files: %w", err)
+		}
+		submissionFiles = uploadedFiles
+	}
+
+	// Process submission
+	submissionInput := &db.FormSubmissionInput{
+		FormDefinitionID: form.ID,
+		UserID:           input.UserID,
+		Status:           input.Status,
+		Data:             input.Data,
+		Files:            submissionFiles,
+		Metadata:         input.Metadata,
+	}
+
+	submission, err := s.store.ProcessFormSubmissionTx(ctx, submissionInput)
+	if err != nil {
+		return nil, fmt.Errorf("failed to process submission: %w", err)
+	}
+
+	// Trigger after events
+	afterEventType := "after_submit"
+	if input.Status == "draft" {
+		afterEventType = "after_draft_create"
+	}
+	s.triggerEvents(ctx, form.ID, afterEventType, submission)
+
+	// Send notifications for final submissions
+	if form.RequiresApproval && input.Status == "submitted" {
+		// TODO: Implement notification logic
+		s.logger.Info("Form submitted for approval", map[string]interface{}{
+			"form_id":       form.ID,
+			"submission_id": submission.ID,
+			"user_id":       input.UserID,
+		})
+	}
+
+	return submission, nil
 }
 
-type StepProgressResult struct {
-	Success              bool  `json:"success"`
-	CurrentStep          int32 `json:"current_step"`
-	CompletionPercentage int32 `json:"completion_percentage"`
-	AllStepsCompleted    bool  `json:"all_steps_completed"`
+// handleValidatedFileUploads processes file uploads after validation
+func (s *FormService) handleValidatedFileUploads(
+	ctx context.Context,
+	fields []db.FormField,
+	userID uuid.UUID,
+	files map[string][]*multipart.FileHeader,
+) ([]db.FormSubmissionFileInput, error) {
+
+	var result []db.FormSubmissionFileInput
+
+	for fieldName, fileHeaders := range files {
+		field := s.findField(fields, fieldName)
+		if field == nil {
+			continue
+		}
+
+		// Parse file configuration for upload path generation
+		var fileConfig FileConfig
+		if field.FileConfig != nil {
+			if err := json.Unmarshal(field.FileConfig, &fileConfig); err != nil {
+				return nil, fmt.Errorf("failed to parse file config for field %s: %w", fieldName, err)
+			}
+		}
+
+		for i, fileHeader := range fileHeaders {
+			// Open file
+			file, err := fileHeader.Open()
+			if err != nil {
+				return nil, fmt.Errorf("failed to open file %s: %w", fileHeader.Filename, err)
+			}
+			defer file.Close()
+
+			// Generate secure file path
+			filename := s.generateSecureFilename(fileHeader.Filename, userID, fieldName, i)
+			path := fmt.Sprintf("forms/%s/%s/%s", userID.String(), fieldName, filename)
+
+			// Upload file
+			if err := s.uploader.Upload(file, s.config.FileBucket, path); err != nil {
+				return nil, fmt.Errorf("failed to upload file %s: %w", fileHeader.Filename, err)
+			}
+
+			// Create file record
+			result = append(result, db.FormSubmissionFileInput{
+				FieldName:       fieldName,
+				FileName:        fileHeader.Filename,
+				FilePath:        path,
+				FileSize:        fileHeader.Size,
+				MimeType:        fileHeader.Header.Get("Content-Type"),
+				Bucket:          s.config.FileBucket,
+				StorageProvider: s.config.FileUploadProvider,
+			})
+
+			s.logger.Info("File uploaded successfully", map[string]interface{}{
+				"user_id":    userID,
+				"field_name": fieldName,
+				"filename":   fileHeader.Filename,
+				"size":       fileHeader.Size,
+				"path":       path,
+			})
+		}
+	}
+
+	return result, nil
+}
+
+// generateSecureFilename generates a secure filename to prevent path traversal
+func (s *FormService) generateSecureFilename(originalName string, userID uuid.UUID, fieldName string, index int) string {
+	ext := filepath.Ext(originalName)
+	timestamp := time.Now().Unix()
+	hash := sha256.Sum256([]byte(fmt.Sprintf("%s_%s_%d_%d", userID.String(), originalName, index, timestamp)))
+	return fmt.Sprintf("%s_%d_%x%s", fieldName, timestamp, hash[:8], ext)
 }

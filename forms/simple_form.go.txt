@@ -1,0 +1,139 @@
+package forms
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"github.com/google/uuid"
+	db "github.com/timchuks/monieverse/internal/db/sqlc"
+)
+
+func CreateSimpleContactForm(ctx context.Context, store db.Store, creatorID uuid.UUID) error {
+	input := &db.FormDefinitionInput{
+		Name:             "Contact Us Form",
+		Slug:             "about-us-form",
+		Description:      "Simple contact form for customer inquiries",
+		FormType:         "about",
+		IsMultiStep:      false,
+		RequiresApproval: false,
+		CreatedBy:        creatorID,
+		Fields: []db.FieldInput{
+			{
+				FieldName:    "name",
+				FieldType:    "text",
+				Label:        map[string]string{"en": "Your Name", "fr": "Votre nom"},
+				Placeholder:  map[string]string{"en": "Enter your full name", "fr": "Entrez votre nom complet"},
+				DisplayOrder: 1,
+				IsRequired:   true,
+				StepNumber:   1,
+				ValidationRules: map[string]interface{}{
+					"required":   true,
+					"min_length": 2,
+					"max_length": 100,
+				},
+			},
+			{
+				FieldName:    "email",
+				FieldType:    "email",
+				StepNumber:   1,
+				Label:        map[string]string{"en": "Email Address", "fr": "Adresse e-mail"},
+				Placeholder:  map[string]string{"en": "your@email.com", "fr": "votre@email.com"},
+				DisplayOrder: 2,
+				IsRequired:   true,
+				ValidationRules: map[string]interface{}{
+					"required": true,
+					"email":    true,
+				},
+			},
+			{
+				FieldName:    "subject",
+				FieldType:    "select",
+				StepNumber:   1,
+				Label:        map[string]string{"en": "Subject", "fr": "Sujet"},
+				DisplayOrder: 3,
+				IsRequired:   true,
+				Options: map[string]interface{}{
+					"type": "static",
+					"static": []map[string]interface{}{
+						{"value": "general", "label": map[string]string{"en": "General Inquiry", "fr": "Demande générale"}},
+						{"value": "support", "label": map[string]string{"en": "Technical Support", "fr": "Support technique"}},
+						{"value": "billing", "label": map[string]string{"en": "Billing Question", "fr": "Question de facturation"}},
+						{"value": "feedback", "label": map[string]string{"en": "Feedback", "fr": "Commentaires"}},
+					},
+				},
+				ValidationRules: map[string]interface{}{
+					"required": true,
+				},
+			},
+			{
+				FieldName:    "message",
+				FieldType:    "textarea",
+				StepNumber:   1,
+				Label:        map[string]string{"en": "Message", "fr": "Message"},
+				Placeholder:  map[string]string{"en": "Type your message here...", "fr": "Tapez votre message ici..."},
+				HelpText:     map[string]string{"en": "Please provide as much detail as possible", "fr": "Veuillez fournir autant de détails que possible"},
+				DisplayOrder: 4,
+				IsRequired:   true,
+				ValidationRules: map[string]interface{}{
+					"required":   true,
+					"min_length": 10,
+					"max_length": 1000,
+				},
+			},
+			{
+				FieldName:    "attachment",
+				FieldType:    "file",
+				StepNumber:   1,
+				Label:        map[string]string{"en": "Attachment (optional)", "fr": "Pièce jointe (facultatif)"},
+				HelpText:     map[string]string{"en": "You can attach a file up to 5MB", "fr": "Vous pouvez joindre un fichier jusqu'à 5 Mo"},
+				DisplayOrder: 5,
+				IsRequired:   false,
+				FileConfig: map[string]interface{}{
+					"max_size":      5242880, // 5MB
+					"allowed_types": []string{"image/jpeg", "image/png", "application/pdf"},
+				},
+			},
+		},
+		PersistenceConfig: &db.PersistenceConfigInput{
+			PersistenceMode: "json", // Store as JSON in form_submissions table
+		},
+	}
+
+	// Create the form
+	form, err := store.CreateFormDefinitionTx(ctx, input)
+	if err != nil {
+		return fmt.Errorf("form creation: %w", err)
+	}
+
+	// Create assignment - available to all users
+	_, err = store.CreateFormAssignment(ctx, db.CreateFormAssignmentParams{
+		ID:               uuid.New(),
+		FormDefinitionID: form.ID,
+		AssignmentType:   "custom",
+		AssignmentValue:  "all_users",
+		Priority:         1,
+		CreatedBy:        db.NewNullUUID(creatorID),
+	})
+
+	if err != nil {
+		return fmt.Errorf("create form assignment: %w", err)
+	}
+
+	// Create email notification event
+	emailConfig, _ := json.Marshal(map[string]interface{}{
+		"template": "contact_form_submitted",
+		"to":       "support@company.com",
+		"subject":  "New Contact Form Submission",
+	})
+
+	_, err = store.CreateFormEvent(ctx, db.CreateFormEventParams{
+		ID:               uuid.New(),
+		FormDefinitionID: form.ID,
+		EventType:        "after_submit",
+		HandlerType:      "email",
+		HandlerConfig:    emailConfig,
+		IsActive:         true,
+	})
+
+	return err
+}

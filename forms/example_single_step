@@ -1,0 +1,203 @@
+func CreateAddressChangeForm(ctx context.Context, store db.Store, creatorID uuid.UUID) error {
+    input := &db.FormDefinitionInput{
+        Name:             "Address Change Request",
+        Slug:             "address-change",
+        Description:      "Form to update user address information",
+        FormType:         "profile_update",
+        IsMultiStep:      false,
+        RequiresApproval: true,
+        CreatedBy:        creatorID,
+        ApprovalWorkflow: &db.ApprovalWorkflowInput{
+            States: []map[string]interface{}{
+                {
+                    "name":        "submitted",
+                    "label":       map[string]string{"en": "Submitted"},
+                    "is_final":    false,
+                    "permissions": []string{"user"},
+                },
+                {
+                    "name":        "approved",
+                    "label":       map[string]string{"en": "Approved"},
+                    "is_final":    true,
+                    "permissions": []string{"admin", "compliance"},
+                },
+                {
+                    "name":        "rejected",
+                    "label":       map[string]string{"en": "Rejected"},
+                    "is_final":    true,
+                    "permissions": []string{"admin", "compliance"},
+                },
+            },
+            Transitions: []map[string]interface{}{
+                {
+                    "from":        "submitted",
+                    "to":          "approved",
+                    "label":       map[string]string{"en": "Approve"},
+                    "permissions": []string{"admin", "compliance"},
+                },
+                {
+                    "from":        "submitted",
+                    "to":          "rejected",
+                    "label":       map[string]string{"en": "Reject"},
+                    "permissions": []string{"admin", "compliance"},
+                },
+            },
+        },
+        Fields: []db.FieldInput{
+            {
+                FieldName:    "current_address",
+                FieldType:    "textarea",
+                Label:        map[string]string{"en": "Current Address"},
+                DisplayOrder: 1,
+                IsRequired:   true,
+                IsReadonly:   true, // Pre-populated from user data
+            },
+            {
+                FieldName:    "new_address_line1",
+                FieldType:    "text",
+                Label:        map[string]string{"en": "New Address Line 1"},
+                Placeholder:  map[string]string{"en": "Street address"},
+                DisplayOrder: 2,
+                IsRequired:   true,
+                ValidationRules: map[string]interface{}{
+                    "required":   true,
+                    "min_length": 5,
+                    "max_length": 200,
+                },
+            },
+            {
+                FieldName:    "new_address_line2",
+                FieldType:    "text",
+                Label:        map[string]string{"en": "New Address Line 2"},
+                Placeholder:  map[string]string{"en": "Apartment, suite, etc. (optional)"},
+                DisplayOrder: 3,
+                IsRequired:   false,
+            },
+            {
+                FieldName:    "city",
+                FieldType:    "text",
+                Label:        map[string]string{"en": "City"},
+                DisplayOrder: 4,
+                IsRequired:   true,
+                ValidationRules: map[string]interface{}{
+                    "required":   true,
+                    "min_length": 2,
+                    "max_length": 100,
+                },
+            },
+            {
+                FieldName:    "state",
+                FieldType:    "select",
+                Label:        map[string]string{"en": "State/Province"},
+                DisplayOrder: 5,
+                IsRequired:   true,
+                Options: map[string]interface{}{
+                    "type": "dynamic",
+                    "dynamic": map[string]interface{}{
+                        "source_name": "states",
+                        "filter_params": map[string]string{
+                            "country": "{{user.country_code}}", // Dynamic based on user's country
+                        },
+                    },
+                },
+            },
+            {
+                FieldName:    "postal_code",
+                FieldType:    "text",
+                Label:        map[string]string{"en": "Postal/ZIP Code"},
+                DisplayOrder: 6,
+                IsRequired:   true,
+                ValidationRules: map[string]interface{}{
+                    "required": true,
+                    "pattern":  "^[A-Za-z0-9\\s-]{3,10}$",
+                    "custom_rules": map[string]interface{}{
+                        "postal_code": map[string]interface{}{
+                            "country": "{{user.country_code}}",
+                        },
+                    },
+                },
+            },
+            {
+                FieldName:    "proof_of_address",
+                FieldType:    "file",
+                Label:        map[string]string{"en": "Proof of Address"},
+                HelpText:     map[string]string{"en": "Upload a utility bill, bank statement, or government document showing your new address"},
+                DisplayOrder: 7,
+                IsRequired:   true,
+                FileConfig: map[string]interface{}{
+                    "max_size":      10485760, // 10MB
+                    "allowed_types": []string{"application/pdf", "image/jpeg", "image/png"},
+                },
+            },
+            {
+                FieldName:    "reason_for_change",
+                FieldType:    "textarea",
+                Label:        map[string]string{"en": "Reason for Change"},
+                Placeholder:  map[string]string{"en": "Please explain why you're changing your address"},
+                DisplayOrder: 8,
+                IsRequired:   true,
+                ValidationRules: map[string]interface{}{
+                    "required":   true,
+                    "min_length": 10,
+                    "max_length": 500,
+                },
+            },
+        },
+        PersistenceConfig: &db.PersistenceConfigInput{
+            PersistenceMode: "direct",
+            TargetConfigs: []map[string]interface{}{
+                {
+                    "table_name": "users",
+                    "priority":   1,
+                },
+            },
+            FieldMappings: map[string]interface{}{
+                "new_address_line1": map[string]interface{}{
+                    "form_field":  "new_address_line1",
+                    "table_name":  "users",
+                    "column_name": "address",
+                    "data_type":   "text",
+                    "transform":   "concat_address", // Custom function to concat line1 and line2
+                },
+                "city": map[string]interface{}{
+                    "form_field":  "city",
+                    "table_name":  "users",
+                    "column_name": "city",
+                    "data_type":   "varchar",
+                },
+                "state": map[string]interface{}{
+                    "form_field":  "state",
+                    "table_name":  "users",
+                    "column_name": "state",
+                    "data_type":   "varchar",
+                },
+                "postal_code": map[string]interface{}{
+                    "form_field":  "postal_code",
+                    "table_name":  "users",
+                    "column_name": "zipcode",
+                    "data_type":   "varchar",
+                },
+            },
+        },
+    }
+
+    form, err := store.CreateFormDefinitionTx(ctx, input)
+    if err != nil {
+        return err
+    }
+
+    // Assign to all verified users
+    _, err = store.CreateFormAssignment(ctx, db.CreateFormAssignmentParams{
+        ID:               uuid.New(),
+        FormDefinitionID: form.ID,
+        AssignmentType:   "custom",
+        AssignmentValue:  "verified_users",
+        Conditions: json.RawMessage(`{
+            "kyc_verified": true
+        }`),
+        Priority:  10,
+        CreatedBy: creatorID,
+    })
+
+    return err
+}

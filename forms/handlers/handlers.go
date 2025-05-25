@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
+	"mime/multipart"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -19,6 +22,22 @@ import (
 type FormHandler struct {
 	srv         *server.Server
 	formService *service.FormService
+}
+
+// StandardFormData represents the standardized form data structure
+type StandardFormData struct {
+	Fields map[string]interface{}             `json:"fields"`
+	Files  map[string][]*multipart.FileHeader `json:"-"`
+	Meta   FormMeta                           `json:"meta"`
+}
+
+// FormMeta contains metadata about the form submission
+type FormMeta struct {
+	Status         string                 `json:"status"`          // draft, in_progress, completed, submitted
+	IsPartial      bool                   `json:"is_partial"`      // Whether this is a partial update
+	StepNumber     *int32                 `json:"step_number"`     // For step-specific operations
+	SkipValidation bool                   `json:"skip_validation"` // Skip validation (admin only)
+	Metadata       map[string]interface{} `json:"metadata"`        // Additional metadata
 }
 
 func NewFormHandler(srv *server.Server, formService *service.FormService) *FormHandler {
@@ -935,6 +954,7 @@ func (h *FormHandler) SaveStepProgress(ctx *gin.Context) {
 
 	// Handle file uploads for this step
 	if len(ctx.Request.MultipartForm.File) > 0 {
+		log.Printf("handle file upload")
 		// Process files and update data with file references
 		// Similar to regular form submission
 	}
@@ -1051,4 +1071,200 @@ func (h *FormHandler) GetStepData(ctx *gin.Context) {
 		"data":         stepData,
 		"completed_at": progress.CompletedAt,
 	})
+}
+
+// parseStandardFormData extracts form data in standardized format
+func (h *FormHandler) parseStandardFormData(ctx *gin.Context) (*StandardFormData, error) {
+	// Parse multipart form
+	err := ctx.Request.ParseMultipartForm(h.srv.Config.MaxBodyPayloadSize)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse multipart form: %w", err)
+	}
+
+	data := &StandardFormData{
+		Fields: make(map[string]interface{}),
+		Files:  ctx.Request.MultipartForm.File,
+		Meta: FormMeta{
+			Status:    "draft", // Default status
+			IsPartial: false,
+			Metadata:  make(map[string]interface{}),
+		},
+	}
+
+	// Extract regular form fields
+	for key, values := range ctx.Request.MultipartForm.Value {
+		// Handle meta fields with underscore prefix
+		if strings.HasPrefix(key, "_") {
+			h.parseMetaField(key, values, &data.Meta)
+			continue
+		}
+
+		// Handle regular fields
+		if len(values) == 1 {
+			data.Fields[key] = h.parseFieldValue(values[0])
+		} else if len(values) > 1 {
+			// Handle multi-value fields (checkboxes, multi-select)
+			parsedValues := make([]interface{}, len(values))
+			for i, v := range values {
+				parsedValues[i] = h.parseFieldValue(v)
+			}
+			data.Fields[key] = parsedValues
+		}
+	}
+
+	// Add request metadata
+	data.Meta.Metadata["ip_address"] = ctx.ClientIP()
+	data.Meta.Metadata["user_agent"] = ctx.Request.UserAgent()
+	data.Meta.Metadata["timestamp"] = time.Now()
+
+	return data, nil
+}
+
+// parseMetaField handles meta fields like _status, _partial, etc.
+func (h *FormHandler) parseMetaField(key string, values []string, meta *FormMeta) {
+	if len(values) == 0 {
+		return
+	}
+
+	value := values[0]
+
+	switch key {
+	case "_status":
+		meta.Status = value
+	case "_partial":
+		meta.IsPartial = value == "true"
+	case "_step":
+		if stepNum, err := strconv.ParseInt(value, 10, 32); err == nil {
+			step := int32(stepNum)
+			meta.StepNumber = &step
+		}
+	case "_skip_validation":
+		meta.SkipValidation = value == "true"
+	default:
+		// Store other meta fields in metadata
+		metaKey := strings.TrimPrefix(key, "_")
+		meta.Metadata[metaKey] = value
+	}
+}
+
+// parseFieldValue attempts to parse string values to appropriate types
+func (h *FormHandler) parseFieldValue(value string) interface{} {
+	// Try to parse as number
+	if num, err := strconv.ParseFloat(value, 64); err == nil {
+		// Check if it's actually an integer
+		if num == float64(int64(num)) {
+			return int64(num)
+		}
+		return num
+	}
+
+	// Try to parse as boolean
+	if value == "true" || value == "false" {
+		return value == "true"
+	}
+
+	// Try to parse as JSON (for complex objects)
+	if (strings.HasPrefix(value, "{") && strings.HasSuffix(value, "}")) ||
+		(strings.HasPrefix(value, "[") && strings.HasSuffix(value, "]")) {
+		var jsonValue interface{}
+		if err := json.Unmarshal([]byte(value), &jsonValue); err == nil {
+			return jsonValue
+		}
+	}
+
+	// Return as string if no parsing succeeded
+	return value
+}
+
+// CreateDraftSubmission creates a new draft submission
+func (h *FormHandler) CreateDraftSubmission(ctx *gin.Context) {
+	user := h.srv.ContextGetUser(ctx)
+
+	formID, err := uuid.Parse(ctx.Param("id"))
+	if err != nil {
+		h.srv.ErrorJSONResponse(ctx, http.StatusBadRequest, fmt.Errorf("invalid form ID"))
+		return
+	}
+
+	// Parse form data
+	formData, err := h.parseStandardFormData(ctx)
+	if err != nil {
+		h.srv.ErrorJSONResponse(ctx, http.StatusBadRequest, err)
+		return
+	}
+
+	// Force draft status for this endpoint
+	formData.Meta.Status = "draft"
+
+	// Create submission input
+	input := service.CreateSubmissionInput{
+		FormID:     formID,
+		UserID:     user.ID,
+		Data:       formData.Fields,
+		Files:      formData.Files,
+		Status:     formData.Meta.Status,
+		IsPartial:  formData.Meta.IsPartial,
+		Metadata:   formData.Meta.Metadata,
+		StepNumber: formData.Meta.StepNumber,
+	}
+
+	submission, err := h.formService.CreateSubmission(ctx, input)
+	if err != nil {
+		h.srv.ErrorJSONResponse(ctx, http.StatusBadRequest, err)
+		return
+	}
+
+	response := map[string]interface{}{
+		"submission": submission,
+		"message":    "Draft submission created successfully",
+		"status":     "draft",
+	}
+
+	h.srv.SuccessJSONResponse(ctx, http.StatusCreated, "Draft created successfully", response)
+}
+
+// SubmitFormFinal submits a complete form (replaces old SubmitForm)
+func (h *FormHandler) SubmitFormFinal(ctx *gin.Context) {
+	user := h.srv.ContextGetUser(ctx)
+
+	formID, err := uuid.Parse(ctx.Param("id"))
+	if err != nil {
+		h.srv.ErrorJSONResponse(ctx, http.StatusBadRequest, fmt.Errorf("invalid form ID"))
+		return
+	}
+
+	// Parse form data
+	formData, err := h.parseStandardFormData(ctx)
+	if err != nil {
+		h.srv.ErrorJSONResponse(ctx, http.StatusBadRequest, err)
+		return
+	}
+
+	// Force submitted status for final submission
+	formData.Meta.Status = "submitted"
+
+	input := service.CreateSubmissionInput{
+		FormID:     formID,
+		UserID:     user.ID,
+		Data:       formData.Fields,
+		Files:      formData.Files,
+		Status:     formData.Meta.Status,
+		IsPartial:  false, // Final submissions are never partial
+		Metadata:   formData.Meta.Metadata,
+		StepNumber: formData.Meta.StepNumber,
+	}
+
+	submission, err := h.formService.CreateSubmission(ctx, input)
+	if err != nil {
+		h.srv.ErrorJSONResponse(ctx, http.StatusBadRequest, err)
+		return
+	}
+
+	response := map[string]interface{}{
+		"submission": submission,
+		"message":    "Form submitted successfully",
+		"status":     "submitted",
+	}
+
+	h.srv.SuccessJSONResponse(ctx, http.StatusOK, "Form submitted successfully", response)
 }

@@ -3,6 +3,7 @@ package forms
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"github.com/google/uuid"
 	db "github.com/timchuks/monieverse/internal/db/sqlc"
 )
@@ -528,6 +529,10 @@ func CreateKYBForm(ctx context.Context, store db.Store, creatorID uuid.UUID) err
 		Priority:         10,
 		CreatedBy:        db.NewNullUUID(creatorID),
 	})
+
+	if err != nil {
+		return fmt.Errorf("create form assignment: %w", err)
+	}
 
 	// Special assignment for Delaware businesses
 	delawareConditions, _ := json.Marshal(map[string]interface{}{

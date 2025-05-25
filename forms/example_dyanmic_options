@@ -1,0 +1,71 @@
+func CreateDynamicOptionSources(ctx context.Context, store db.Store) error {
+    // Banks dynamic source
+    banksConfig, _ := json.Marshal(map[string]interface{}{
+        "table": "banks",
+        "value_field": "id",
+        "label_field": "name",
+        "where_clause": "active = true AND country = :country",
+        "order_by": "name ASC",
+    })
+    
+    _, err := store.CreateDynamicOption(ctx, db.CreateDynamicOptionParams{
+        ID:            uuid.New(),
+        Name:          "banks",
+        SourceType:    "table",
+        SourceConfig:  banksConfig,
+        CacheDuration: 3600, // 1 hour
+    })
+    
+    // Countries dynamic source
+    countriesConfig, _ := json.Marshal(map[string]interface{}{
+        "table": "countries",
+        "value_field": "code",
+        "label_field": "name",
+        "where_clause": "enabled = true",
+        "order_by": "name ASC",
+    })
+    
+    _, err = store.CreateDynamicOption(ctx, db.CreateDynamicOptionParams{
+        ID:            uuid.New(),
+        Name:          "countries",
+        SourceType:    "table",
+        SourceConfig:  countriesConfig,
+        CacheDuration: 86400, // 24 hours
+    })
+    
+    // States dynamic source
+    statesConfig, _ := json.Marshal(map[string]interface{}{
+        "function": "getStatesByCountry",
+        "params": ["country"],
+    })
+    
+    _, err = store.CreateDynamicOption(ctx, db.CreateDynamicOptionParams{
+        ID:            uuid.New(),
+        Name:          "states",
+        SourceType:    "function",
+        SourceConfig:  statesConfig,
+        CacheDuration: 3600,
+    })
+    
+    // External API source example
+    industriesConfig, _ := json.Marshal(map[string]interface{}{
+        "endpoint": "https://api.example.com/industries",
+        "method": "GET",
+        "headers": map[string]string{
+            "X-API-Key": "{{INDUSTRY_API_KEY}}",
+        },
+        "response_path": "data.industries",
+        "value_field": "code",
+        "label_field": "name",
+    })
+    
+    _, err = store.CreateDynamicOption(ctx, db.CreateDynamicOptionParams{
+        ID:            uuid.New(),
+        Name:          "industries",
+        SourceType:    "api",
+        SourceConfig:  industriesConfig,
+        CacheDuration: 86400,
+    })
+    
+    return err
+}
